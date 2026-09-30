@@ -1,0 +1,86 @@
+--- a/libavfilter/avfilter.h
++++ b/libavfilter/avfilter.h
+@@ -558,6 +558,11 @@
+ typedef int (avfilter_execute_func)(AVFilterContext *ctx, avfilter_action_func *func,
+                                     void *arg, int *ret, int nb_jobs);
+ 
++/* Private Fluxrec extension: report a completed Vulkan filter timestamp. */
++typedef void (AVFilterDeviceTimingCallback)(void *opaque, const char *stage,
++                                            int64_t frame_pts,
++                                            uint64_t elapsed_ns);
++
+ typedef struct AVFilterGraph {
+     const AVClass *av_class;
+     AVFilterContext **filters;
+@@ -616,7 +621,15 @@
+      * avfilter_graph_config().
+      */
+     unsigned max_buffered_frames;
++
++    /* Private Fluxrec callback, configured before graph initialization. */
++    AVFilterDeviceTimingCallback *fluxrec_device_timing_callback;
++    void *fluxrec_device_timing_opaque;
+ } AVFilterGraph;
++
++/* Private Fluxrec extension; callback state is borrowed until graph teardown. */
++void avfilter_graph_set_fluxrec_device_timing_callback(
++    AVFilterGraph *graph, AVFilterDeviceTimingCallback *callback, void *opaque);
+ 
+ /**
+  * Allocate a filter graph.
+--- a/libavfilter/avfiltergraph.c
++++ b/libavfilter/avfiltergraph.c
+@@ -96,6 +96,16 @@
+     ff_framequeue_global_init(&graph->frame_queues);
+ 
+     return ret;
++}
++
++void avfilter_graph_set_fluxrec_device_timing_callback(
++    AVFilterGraph *graph, AVFilterDeviceTimingCallback *callback, void *opaque)
++{
++    if (!graph)
++        return;
++
++    graph->fluxrec_device_timing_callback = callback;
++    graph->fluxrec_device_timing_opaque = callback ? opaque : NULL;
+ }
+ 
+ void ff_filter_graph_remove_filter(AVFilterGraph *graph, AVFilterContext *filter)
+--- a/libavfilter/vulkan_filter.c
++++ b/libavfilter/vulkan_filter.c
+@@ -270,6 +270,14 @@
+         long double elapsed_ns = (long double)ticks * timing->timestamp_period_ns;
+         if (elapsed_ns >= 0.0L && elapsed_ns <= UINT64_MAX) {
+             uint64_t elapsed = (uint64_t)elapsed_ns;
++            AVFilterGraph *graph = avctx->graph;
++
++            if (graph && graph->fluxrec_device_timing_callback &&
++                exec->query_pts != AV_NOPTS_VALUE)
++                graph->fluxrec_device_timing_callback(
++                    graph->fluxrec_device_timing_opaque, avctx->name,
++                    exec->query_pts, elapsed);
++
+             timing->batch_samples++;
+             timing->batch_total_ns += elapsed;
+             timing->batch_min_ns = FFMIN(timing->batch_min_ns, elapsed);
+@@ -345,6 +353,9 @@
+     if (timing && timing->enabled)
+         vk->CmdWriteTimestamp(exec->buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                               e->query_pool, exec->query_idx + 1);
++
++    if (timing && timing->enabled)
++        exec->query_pts = in_f ? in_f->pts : AV_NOPTS_VALUE;
+ 
+     err = ff_vk_exec_submit(vkctx, exec);
+     if (err < 0)
+--- a/libavutil/vulkan.h
++++ b/libavutil/vulkan.h
+@@ -113,6 +113,7 @@
+     const struct FFVkExecPool *parent;
+     int had_submission;
+     int query_data_valid;
++    int64_t query_pts;
+ 
+     /* Queue for the execution context */
+     VkQueue queue;

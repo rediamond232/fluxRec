@@ -1,0 +1,61 @@
+#version 450
+
+// Post-scale correction for imported XRGB/ARGB byte order. The stable
+// scale_vulkan passes produce limited-range BT.709 NV12; because FFmpeg maps
+// the BGRA DMA-BUF bytes through an R8G8B8A8 Vulkan image, red and blue are
+// reversed. This shader swaps those channels in YCbCr space without reading
+// the original RGB DMA-BUF again.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D sourceY;
+layout(set = 0, binding = 1) uniform sampler2D sourceUV;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D destinationY;
+layout(set = 0, binding = 3, rg8) uniform writeonly image2D destinationUV;
+
+layout(push_constant) uniform Params {
+    uvec2 sourceExtent;
+} params;
+
+float swap_y(float y, float cb, float cr) {
+    return y + 0.26052624 * cb - 0.22110192 * cr;
+}
+
+vec2 swap_chroma(float cb, float cr) {
+    return vec2(-0.1404 * cb + 0.967828153 * cr,
+                 1.01287386 * cb + 0.1404 * cr);
+}
+
+float limited_y_code(float y) {
+    return clamp((16.0 + 219.0 * y) / 255.0,
+                 16.0 / 255.0, 235.0 / 255.0);
+}
+
+float limited_c_code(float c) {
+    return clamp((128.0 + 224.0 * c) / 255.0,
+                 16.0 / 255.0, 240.0 / 255.0);
+}
+
+void main() {
+    const ivec2 chromaCoord = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 chromaExtent = ivec2(params.sourceExtent / 2u);
+    if (any(greaterThanEqual(chromaCoord, chromaExtent))) return;
+
+    const ivec2 lumaBase = chromaCoord * 2;
+    const vec2 inputUV = texelFetch(sourceUV, chromaCoord, 0).rg;
+    const float cb = (inputUV.r * 255.0 - 128.0) / 224.0;
+    const float cr = (inputUV.g * 255.0 - 128.0) / 224.0;
+    const vec2 outputUV = swap_chroma(cb, cr);
+
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            const ivec2 p = lumaBase + ivec2(dx, dy);
+            const float inputY = texelFetch(sourceY, p, 0).r;
+            const float y = (inputY * 255.0 - 16.0) / 219.0;
+            imageStore(destinationY, p, vec4(limited_y_code(swap_y(y, cb, cr))));
+        }
+    }
+
+    imageStore(destinationUV, chromaCoord,
+               vec4(limited_c_code(outputUV.x), limited_c_code(outputUV.y), 0.0, 1.0));
+}

@@ -1,0 +1,38 @@
+diff --git a/libavfilter/vulkan_filter.c b/libavfilter/vulkan_filter.c
+--- a/libavfilter/vulkan_filter.c
++++ b/libavfilter/vulkan_filter.c
+@@ -20,6 +20,7 @@
+ #include "filters.h"
+ #include "vulkan_filter.h"
+ #include "libavutil/vulkan_loader.h"
++#include "libavutil/getenv_utf8.h"
+ 
+ int ff_vk_filter_init_context(AVFilterContext *avctx, FFVulkanContext *s,
+                               AVBufferRef *frames_ref,
+@@ -245,6 +246,7 @@
+                                 void *push_src, size_t push_size)
+ {
+     int err = 0;
++    char *sync_wait;
+     FFVulkanFunctions *vk = &vkctx->vkfn;
+     VkImageView in_views[AV_NUM_DATA_POINTERS];
+     VkImageView out_views[AV_NUM_DATA_POINTERS];
+@@ -307,7 +309,16 @@
+                     FFALIGN(vkctx->output_height, shd->lg_size[1])/shd->lg_size[1],
+                     wgc_z);
+ 
+-    return ff_vk_exec_submit(vkctx, exec);
++    err = ff_vk_exec_submit(vkctx, exec);
++    if (err < 0)
++        return err;
++
++    sync_wait = getenv_utf8("FLUXREC_FF_VK_WAIT_SIMPLE");
++    if (sync_wait && sync_wait[0])
++        ff_vk_exec_wait(vkctx, exec);
++    freeenv_utf8(sync_wait);
++
++    return err;
+ fail:
+     ff_vk_exec_discard_deps(vkctx, exec);
+     return err;
+ }

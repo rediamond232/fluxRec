@@ -1,0 +1,14 @@
+/build/
+/build-*/
+**/build/
+/out/
+/.deps/
+/.validation/
+*.mkv
+*.mp4
+*.o
+*.so
+*.a
+compile_commands.json
+__pycache__/
+*.pyc

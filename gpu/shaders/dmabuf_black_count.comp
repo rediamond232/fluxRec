@@ -1,0 +1,36 @@
+#version 450
+
+// Counts, but never exports, pixels whose Rec. 709 luma is at most 0.10.
+// Each workgroup reduces locally, then contributes one count to a single
+// 32-bit aggregate counter.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D sourceImage;
+layout(std430, set = 0, binding = 1) buffer BlackPixelCount {
+    uint blackPixels;
+} result;
+
+layout(push_constant) uniform ProbeParams {
+    uvec2 extent;
+} params;
+
+shared uint localBlackPixels;
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u)
+        localBlackPixels = 0u;
+    barrier();
+
+    uvec2 position = gl_GlobalInvocationID.xy;
+    if (all(lessThan(position, params.extent))) {
+        vec3 rgb = texelFetch(sourceImage, ivec2(position), 0).rgb;
+        float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        if (luma <= 0.10)
+            atomicAdd(localBlackPixels, 1u);
+    }
+
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && localBlackPixels != 0u)
+        atomicAdd(result.blackPixels, localBlackPixels);
+}

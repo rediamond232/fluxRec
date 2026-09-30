@@ -1,0 +1,366 @@
+--- a/libavutil/hwcontext_vulkan.h
++++ b/libavutil/hwcontext_vulkan.h
+@@ -352,4 +352,23 @@
+  */
+ const char **av_vk_get_optional_device_extensions(int *count);
+ 
++/**
++ * Poll pending submissions in this Vulkan frames context's compute execution
++ * pool against one total timeout budget, then release their retained
++ * dependencies. A timeout or poll error leaves unfinished submissions and
++ * their dependencies intact. The deadline uses a monotonic clock, but sleep
++ * scheduling and status-call latency can cause it to overshoot.
++ *
++ * The caller must ensure that no operation is concurrently using frames_ref.
++ * The pool remains initialized and may be used again after a successful call.
++ * Repeated calls are safe.
++ *
++ * @param frames_ref Vulkan AVHWFramesContext reference.
++ * @param timeout_ns Total poll budget in nanoseconds.
++ * @return 0 on success, AVERROR(ETIMEDOUT) on timeout, or another negative
++ *         AVERROR code on failure.
++ */
++int av_vk_frame_ctx_exec_pool_drain(AVBufferRef *frames_ref,
++                                    uint64_t timeout_ns);
++
+ #endif /* AVUTIL_HWCONTEXT_VULKAN_H */
+--- a/libavutil/hwcontext_vulkan.c
++++ b/libavutil/hwcontext_vulkan.c
+@@ -18,6 +18,8 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include <errno.h>
++
+ #define VK_NO_PROTOTYPES
+ #define VK_ENABLE_BETA_EXTENSIONS
+ 
+@@ -40,6 +42,7 @@
+ #include "hwcontext_internal.h"
+ #include "hwcontext_vulkan.h"
+ #include "mem.h"
++#include "time.h"
+ 
+ #include "vulkan.h"
+ #include "vulkan_loader.h"
+@@ -2942,6 +2945,77 @@
+     av_buffer_pool_uninit(&fp->tmp);
+ }
+ 
++int av_vk_frame_ctx_exec_pool_drain(AVBufferRef *frames_ref,
++                                    uint64_t timeout_ns)
++{
++    AVHWFramesContext *hwfc;
++    VulkanDevicePriv *p;
++    VulkanFramesPriv *fp;
++    FFVkExecPool *pool;
++    int64_t start_time_us;
++
++    if (!frames_ref || !frames_ref->data)
++        return AVERROR(EINVAL);
++
++    hwfc = (AVHWFramesContext *)frames_ref->data;
++    if (hwfc->format != AV_PIX_FMT_VULKAN || !hwfc->device_ctx ||
++        hwfc->device_ctx->type != AV_HWDEVICE_TYPE_VULKAN ||
++        !hwfc->device_ctx->hwctx || !hwfc->hwctx)
++        return AVERROR(EINVAL);
++
++    p = hwfc->device_ctx->hwctx;
++    fp = hwfc->hwctx;
++    pool = &fp->compute_exec;
++    /* Make failure at final uninit fail-stop instead of freeing live resources. */
++    pool->fail_closed_drain = 1;
++
++    if (pool->pool_size < 0 || (pool->pool_size && !pool->contexts) ||
++        p->p.act_dev == VK_NULL_HANDLE || !p->vkctx.vkfn.GetFenceStatus)
++        return AVERROR(EINVAL);
++
++    start_time_us = av_gettime_relative();
++    for (int i = 0; i < pool->pool_size; i++) {
++        FFVkExecContext *exec = &pool->contexts[i];
++        VkResult ret;
++
++        if (exec->pending_submission && !exec->fence)
++            return AVERROR(EINVAL);
++
++        if (exec->pending_submission) {
++            int64_t elapsed_us = av_gettime_relative() - start_time_us;
++            uint64_t remaining_timeout_ns;
++
++            if (elapsed_us < 0)
++                elapsed_us = 0;
++            if ((uint64_t)elapsed_us > timeout_ns / 1000 ||
++                ((uint64_t)elapsed_us == timeout_ns / 1000 &&
++                 timeout_ns % 1000 == 0)) {
++                av_log(hwfc, AV_LOG_ERROR,
++                       "Timed out draining Vulkan frame execution pool\n");
++                return AVERROR(ETIMEDOUT);
++            }
++            remaining_timeout_ns = timeout_ns - (uint64_t)elapsed_us * 1000;
++
++            ret = ff_vk_exec_wait_fence_bounded(&p->vkctx, exec,
++                                                 remaining_timeout_ns);
++            if (ret == VK_TIMEOUT) {
++                av_log(hwfc, AV_LOG_ERROR,
++                       "Timed out draining Vulkan frame execution pool\n");
++                return AVERROR(ETIMEDOUT);
++            }
++            if (ret != VK_SUCCESS) {
++                av_log(hwfc, AV_LOG_ERROR,
++                       "Failed to drain Vulkan frame execution pool: %d\n", ret);
++                return AVERROR_EXTERNAL;
++            }
++        }
++
++        /* No dependencies are released until the submission completed. */
++        ff_vk_exec_discard_deps(&p->vkctx, exec);
++    }
++
++    return 0;
++}
+ static int vulkan_frames_init(AVHWFramesContext *hwfc)
+ {
+     int err;
+--- a/libavutil/vulkan.h
++++ b/libavutil/vulkan.h
+@@ -111,7 +111,8 @@
+ typedef struct FFVkExecContext {
+     uint32_t idx;
+     const struct FFVkExecPool *parent;
+-    int had_submission;
++    int pending_submission;
++    int query_pending;
+     int query_data_valid;
+     int64_t query_pts;
+ 
+@@ -259,6 +260,7 @@
+     VkCommandPool *cmd_buf_pools;
+     VkCommandBuffer *cmd_bufs;
+     int pool_size;
++    int fail_closed_drain;
+ 
+     VkQueryPool query_pool;
+     void *query_data;
+@@ -469,6 +471,12 @@
+ int ff_vk_exec_start(FFVulkanContext *s, FFVkExecContext *e);
+ int ff_vk_exec_submit(FFVulkanContext *s, FFVkExecContext *e);
+ void ff_vk_exec_wait(FFVulkanContext *s, FFVkExecContext *e);
++VkResult ff_vk_exec_wait_fence(FFVulkanContext *s, FFVkExecContext *e,
++                               uint64_t timeout_ns);
++VkResult ff_vk_exec_poll_fence(FFVulkanContext *s, FFVkExecContext *e);
++VkResult ff_vk_exec_wait_fence_bounded(FFVulkanContext *s,
++                                       FFVkExecContext *e,
++                                       uint64_t timeout_ns);
+ 
+ /**
+  * Execution dependency management.
+--- a/libavutil/vulkan.c
++++ b/libavutil/vulkan.c
+@@ -17,10 +17,14 @@
+  * License along with FFmpeg; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
++#include <stdio.h>
++#include <stdlib.h>
++
+ 
+ #include "config.h"
+ #include "avassert.h"
+ #include "mem.h"
++#include "time.h"
+ 
+ #include "vulkan.h"
+ #include "libavutil/vulkan_loader.h"
+@@ -296,16 +300,128 @@
+     return NULL;
+ }
+ 
++VkResult ff_vk_exec_wait_fence(FFVulkanContext *s, FFVkExecContext *e,
++                               uint64_t timeout_ns)
++{
++    VkResult ret;
++
++    if (!e->pending_submission)
++        return VK_SUCCESS;
++    if (!s || !s->hwctx || s->hwctx->act_dev == VK_NULL_HANDLE ||
++        !s->vkfn.WaitForFences)
++        return VK_ERROR_INITIALIZATION_FAILED;
++
++    ret = s->vkfn.WaitForFences(s->hwctx->act_dev, 1, &e->fence,
++                                VK_TRUE, timeout_ns);
++    if (ret == VK_SUCCESS)
++        e->pending_submission = 0;
++
++    return ret;
++}
++
++VkResult ff_vk_exec_poll_fence(FFVulkanContext *s, FFVkExecContext *e)
++{
++    VkResult ret;
++
++    if (!e->pending_submission)
++        return VK_SUCCESS;
++    if (!s || !s->hwctx || s->hwctx->act_dev == VK_NULL_HANDLE ||
++        !s->vkfn.GetFenceStatus)
++        return VK_ERROR_INITIALIZATION_FAILED;
++
++    ret = s->vkfn.GetFenceStatus(s->hwctx->act_dev, e->fence);
++    if (ret == VK_SUCCESS)
++        e->pending_submission = 0;
++
++    return ret;
++}
++
++VkResult ff_vk_exec_wait_fence_bounded(FFVulkanContext *s,
++                                               FFVkExecContext *e,
++                                               uint64_t timeout_ns)
++{
++    int64_t start_time_us = av_gettime_relative();
++
++    while (e->pending_submission) {
++        VkResult ret = ff_vk_exec_poll_fence(s, e);
++        int64_t elapsed_us;
++        uint64_t remaining_ns;
++        uint64_t remaining_us;
++        unsigned int sleep_us;
++
++        if (ret == VK_SUCCESS)
++            return VK_SUCCESS;
++        if (ret != VK_NOT_READY)
++            return ret;
++
++        elapsed_us = av_gettime_relative() - start_time_us;
++        if (elapsed_us < 0)
++            elapsed_us = 0;
++        if ((uint64_t)elapsed_us > timeout_ns / 1000 ||
++            ((uint64_t)elapsed_us == timeout_ns / 1000 &&
++             timeout_ns % 1000 == 0))
++            return VK_TIMEOUT;
++
++        remaining_ns = timeout_ns - (uint64_t)elapsed_us * 1000;
++        if (!remaining_ns)
++            return VK_TIMEOUT;
++        remaining_us = remaining_ns / 1000 + !!(remaining_ns % 1000);
++        sleep_us = remaining_us > 1000 ? 1000 : (unsigned int)remaining_us;
++        av_usleep(sleep_us ? sleep_us : 1);
++    }
++
++    return VK_SUCCESS;
++}
++
+ void ff_vk_exec_pool_free(FFVulkanContext *s, FFVkExecPool *pool)
+ {
+     FFVulkanFunctions *vk = &s->vkfn;
++    int64_t start_time_us = pool->fail_closed_drain ?
++                            av_gettime_relative() : 0;
++    const uint64_t timeout_ns = 5000000000ULL;
+ 
+     for (int i = 0; i < pool->pool_size; i++) {
+         FFVkExecContext *e = &pool->contexts[i];
+ 
++        if (e->pending_submission && !e->fence) {
++            av_log(s, AV_LOG_FATAL,
++                   "Vulkan execution pool has pending work without a fence\n");
++            fflush(stderr);
++            abort();
++        }
++
+         if (e->fence) {
+-            if (e->had_submission)
+-                vk->WaitForFences(s->hwctx->act_dev, 1, &e->fence, VK_TRUE, UINT64_MAX);
++            if (e->pending_submission) {
++                if (pool->fail_closed_drain) {
++                    int64_t elapsed_us = av_gettime_relative() - start_time_us;
++                    VkResult ret;
++
++                    if (elapsed_us < 0)
++                        elapsed_us = 0;
++                    if ((uint64_t)elapsed_us > timeout_ns / 1000 ||
++                        ((uint64_t)elapsed_us == timeout_ns / 1000 &&
++                         timeout_ns % 1000 == 0)) {
++                        ret = VK_TIMEOUT;
++                    } else {
++                        uint64_t remaining_ns = timeout_ns -
++                                                (uint64_t)elapsed_us * 1000;
++                        ret = ff_vk_exec_wait_fence_bounded(s, e,
++                                                            remaining_ns);
++                    }
++                    if (ret != VK_SUCCESS) {
++                        av_log(s, AV_LOG_FATAL,
++                               "Opt-in Vulkan input drain did not complete before pool free: %s\n",
++                               ff_vk_ret2str(ret));
++                        fflush(stderr);
++                        abort();
++                    }
++                } else {
++                    /* Preserve FFmpeg's default teardown behavior when the
++                     * opt-in drain API has not enrolled this pool. */
++                    vk->WaitForFences(s->hwctx->act_dev, 1, &e->fence,
++                                      VK_TRUE, UINT64_MAX);
++                }
++            }
+             vk->DestroyFence(s->hwctx->act_dev, e->fence, s->hwctx->alloc);
+         }
+ 
+@@ -577,8 +693,12 @@
+ 
+ void ff_vk_exec_wait(FFVulkanContext *s, FFVkExecContext *e)
+ {
+-    FFVulkanFunctions *vk = &s->vkfn;
+-    vk->WaitForFences(s->hwctx->act_dev, 1, &e->fence, VK_TRUE, UINT64_MAX);
++    VkResult ret = ff_vk_exec_wait_fence(s, e, UINT64_MAX);
++    if (ret != VK_SUCCESS) {
++        av_log(s, AV_LOG_ERROR, "Unable to wait for Vulkan execution: %s\n",
++               ff_vk_ret2str(ret));
++        return;
++    }
+     ff_vk_exec_discard_deps(s, e);
+ }
+ 
+@@ -593,10 +713,16 @@
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+     };
+ 
+-    /* Wait for the fence to be signalled */
+-    vk->WaitForFences(s->hwctx->act_dev, 1, &e->fence, VK_TRUE, UINT64_MAX);
++    /* Only wait when a queue submission actually owns this fence. A failed
++     * command-buffer begin/end/submit leaves a reset fence unsignalled. */
++    ret = ff_vk_exec_wait_fence(s, e, UINT64_MAX);
++    if (ret != VK_SUCCESS) {
++        av_log(s, AV_LOG_ERROR, "Unable to wait for Vulkan execution: %s\n",
++               ff_vk_ret2str(ret));
++        return AVERROR_EXTERNAL;
++    }
+     e->query_data_valid = 0;
+-    if (pool->query_type == VK_QUERY_TYPE_TIMESTAMP && e->had_submission) {
++    if (pool->query_type == VK_QUERY_TYPE_TIMESTAMP && e->query_pending) {
+         ret = vk->GetQueryPoolResults(s->hwctx->act_dev, pool->query_pool,
+                                       e->query_idx, pool->nb_queries,
+                                       pool->qd_size, e->query_data,
+@@ -608,8 +734,14 @@
+                    "Unable to read completed Vulkan timestamp queries: %s\n",
+                    ff_vk_ret2str(ret));
+         }
+-    }
+-    vk->ResetFences(s->hwctx->act_dev, 1, &e->fence);
++        e->query_pending = 0;
++    }
++    ret = vk->ResetFences(s->hwctx->act_dev, 1, &e->fence);
++    if (ret != VK_SUCCESS) {
++        av_log(s, AV_LOG_ERROR, "Failed to reset Vulkan execution fence: %s\n",
++               ff_vk_ret2str(ret));
++        return AVERROR_EXTERNAL;
++    }
+ 
+     /* Discard queue dependencies */
+     ff_vk_exec_discard_deps(s, e);
+@@ -1010,7 +1142,8 @@
+         }
+     }
+ 
+-    e->had_submission = 1;
++    e->pending_submission = 1;
++    e->query_pending = e->parent->query_type == VK_QUERY_TYPE_TIMESTAMP;
+ 
+     return 0;
+ }

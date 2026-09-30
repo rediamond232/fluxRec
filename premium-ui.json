@@ -1,0 +1,10 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": ["ui/src", "ui/preview_consumer"],
+  "locale": "en-US",
+  "canonicalMap": "UX-CONTRACT.md",
+  "requiredCapabilities": ["Select/Listbox"],
+  "ownership": {
+    "Select/Listbox": "native"
+  }
+}

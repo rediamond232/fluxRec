@@ -1,0 +1,2 @@
+/home/lev/Fluxrec/__cmake_systeminformation/CMakeFiles/edit_cache.dir
+/home/lev/Fluxrec/__cmake_systeminformation/CMakeFiles/rebuild_cache.dir

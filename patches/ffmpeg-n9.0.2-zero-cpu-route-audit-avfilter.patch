@@ -1,0 +1,150 @@
+--- a/libavfilter/vf_scale_vulkan.c
++++ b/libavfilter/vf_scale_vulkan.c
+@@ -18,6 +18,16 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include <stdatomic.h>
++#include <string.h>
++#ifdef _WIN32
++#include <process.h>
++#define fluxrec_zero_cpu_getpid _getpid
++#else
++#include <unistd.h>
++#define fluxrec_zero_cpu_getpid getpid
++#endif
++
+ #include "libavutil/opt.h"
+ #include "vulkan_filter.h"
+ #include "scale_eval.h"
+@@ -27,6 +37,12 @@
+ #include "libavutil/getenv_utf8.h"
+ #include "libswscale/swscale.h"
+ 
++static const char *fluxrec_zero_cpu_audit_run_id(void)
++{
++    const char *run_id = getenv("FLUXREC_ZERO_CPU_AUDIT_RUN_ID");
++    return run_id && run_id[0] ? run_id : "unset";
++}
++
+ extern const unsigned char ff_scale_comp_spv_data[];
+ extern const unsigned int ff_scale_comp_spv_len;
+ 
+@@ -83,8 +99,28 @@
+     enum ScalerFunc scaler;
+     enum AVColorRange out_range;
+     enum DebayerFunc debayer;
++
++    /* Diagnostic-only route audit; disabled unless explicitly requested. */
++    int fluxrec_zero_cpu_audit;
++    atomic_int fluxrec_zero_cpu_audit_pass_logged;
++    atomic_uint_fast64_t fluxrec_zero_cpu_audit_vulkan_frames;
++    atomic_uint_fast64_t fluxrec_zero_cpu_audit_rejected_frames;
+ } ScaleVulkanContext;
+ 
++static av_cold int scale_vulkan_init(AVFilterContext *ctx)
++{
++    ScaleVulkanContext *s = ctx->priv;
++    char *audit_env = getenv_utf8("FLUXREC_FF_ZERO_CPU_AUDIT");
++
++    s->fluxrec_zero_cpu_audit = audit_env && !strcmp(audit_env, "1");
++    freeenv_utf8(audit_env);
++    atomic_init(&s->fluxrec_zero_cpu_audit_pass_logged, 0);
++    atomic_init(&s->fluxrec_zero_cpu_audit_vulkan_frames, 0);
++    atomic_init(&s->fluxrec_zero_cpu_audit_rejected_frames, 0);
++
++    return ff_vk_filter_init(ctx);
++}
++
+ static av_cold int init_filter(AVFilterContext *ctx, AVFrame *in)
+ {
+     int err;
+@@ -270,6 +306,31 @@
+         goto fail;
+     }
+ 
++    if (s->fluxrec_zero_cpu_audit) {
++        AVHWFramesContext *in_fc = in->hw_frames_ctx
++            ? (AVHWFramesContext *)in->hw_frames_ctx->data : NULL;
++        AVHWFramesContext *out_fc = out->hw_frames_ctx
++            ? (AVHWFramesContext *)out->hw_frames_ctx->data : NULL;
++        if (s->sws || in->format != AV_PIX_FMT_VULKAN ||
++            out->format != AV_PIX_FMT_VULKAN || !in_fc || !out_fc ||
++            in_fc->format != AV_PIX_FMT_VULKAN ||
++            out_fc->format != AV_PIX_FMT_VULKAN ||
++            in_fc->sw_format != s->vkctx.input_format ||
++            out_fc->sw_format != s->vkctx.output_format) {
++            atomic_fetch_add_explicit(&s->fluxrec_zero_cpu_audit_rejected_frames, 1,
++                                      memory_order_relaxed);
++            av_log(ctx, AV_LOG_ERROR,
++                   "FLUXREC_ZERO_CPU_AUDIT event=scale_vulkan_rejected "
++                   "reason=software_or_non_vulkan_frame input_format=%s output_format=%s "
++                   "software_scaler=%d process_pid=%ld audit_run_id=%s\n",
++                   av_get_pix_fmt_name(in->format), av_get_pix_fmt_name(out->format),
++                   !!s->sws, (long)fluxrec_zero_cpu_getpid(),
++                   fluxrec_zero_cpu_audit_run_id());
++            err = AVERROR(ENOSYS);
++            goto fail;
++        }
++    }
++
+     s->opts.crop_x = in->crop_left;
+     s->opts.crop_y = in->crop_top;
+     s->opts.crop_w = in->width - (in->crop_left + in->crop_right);
+@@ -307,6 +368,28 @@
+         RET(ff_vk_filter_process_simple(ctx, &s->vkctx, &s->e,
+                                         &s->device_timing, &s->shd, out, in,
+                                         s->sampler, 1, &s->opts, sizeof(s->opts)));
++
++        if (s->fluxrec_zero_cpu_audit)
++            atomic_fetch_add_explicit(&s->fluxrec_zero_cpu_audit_vulkan_frames, 1,
++                                      memory_order_relaxed);
++
++        if (s->fluxrec_zero_cpu_audit &&
++            !atomic_exchange_explicit(&s->fluxrec_zero_cpu_audit_pass_logged, 1,
++                                      memory_order_relaxed)) {
++            AVHWFramesContext *in_fc = (AVHWFramesContext *)in->hw_frames_ctx->data;
++            AVHWFramesContext *out_fc = (AVHWFramesContext *)out->hw_frames_ctx->data;
++
++            av_log(ctx, AV_LOG_INFO,
++                   "FLUXREC_ZERO_CPU_AUDIT event=scale_vulkan_submit status=ok "
++                   "stage=%s source=AV_PIX_FMT_VULKAN destination=AV_PIX_FMT_VULKAN "
++                   "source_sw_format=%s destination_sw_format=%s "
++                   "operation=vkCmdDispatch+ff_vk_exec_submit cpu_fallback=disabled pts=%lld "
++                   "process_pid=%ld audit_run_id=%s\n",
++                   ctx->name,
++                   av_get_pix_fmt_name(in_fc->sw_format),
++                   av_get_pix_fmt_name(out_fc->sw_format), (long long)in->pts,
++                   (long)fluxrec_zero_cpu_getpid(), fluxrec_zero_cpu_audit_run_id());
++        }
+     } else {
+         err = sws_scale_frame(s->sws, out, in);
+         if (err < 0)
+@@ -399,6 +482,18 @@
+     FFVulkanContext *vkctx = &s->vkctx;
+     FFVulkanFunctions *vk = &vkctx->vkfn;
+ 
++    if (s->fluxrec_zero_cpu_audit)
++        av_log(avctx, AV_LOG_INFO,
++               "FLUXREC_ZERO_CPU_AUDIT event=frame_route_summary "
++               "route=scale_vulkan stage=%s successful_dispatches=%llu "
++               "rejected_frames=%llu process_pid=%ld audit_run_id=%s\n",
++               avctx->name,
++               (unsigned long long)atomic_load_explicit(
++                   &s->fluxrec_zero_cpu_audit_vulkan_frames, memory_order_relaxed),
++               (unsigned long long)atomic_load_explicit(
++                   &s->fluxrec_zero_cpu_audit_rejected_frames, memory_order_relaxed),
++               (long)fluxrec_zero_cpu_getpid(), fluxrec_zero_cpu_audit_run_id());
++
+     ff_vk_exec_pool_free(vkctx, &s->e);
+     ff_vk_shader_free(vkctx, &s->shd);
+     sws_free_context(&s->sws);
+@@ -459,7 +554,7 @@
+     .p.priv_class   = &scale_vulkan_class,
+     .p.flags        = AVFILTER_FLAG_HWDEVICE,
+     .priv_size      = sizeof(ScaleVulkanContext),
+-    .init           = &ff_vk_filter_init,
++    .init           = &scale_vulkan_init,
+     .uninit         = &scale_vulkan_uninit,
+     FILTER_INPUTS(scale_vulkan_inputs),
+     FILTER_OUTPUTS(scale_vulkan_outputs),

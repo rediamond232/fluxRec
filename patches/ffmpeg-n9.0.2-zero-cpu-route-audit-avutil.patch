@@ -1,0 +1,223 @@
+--- a/libavutil/hwcontext_vulkan.c
++++ b/libavutil/hwcontext_vulkan.c
+@@ -24,11 +24,16 @@
+ #ifdef _WIN32
+ #include <windows.h> /* Included to prevent conflicts with CreateSemaphore */
+ #include <versionhelpers.h>
++#include <process.h>
+ #include "compat/w32dlfcn.h"
++#define fluxrec_zero_cpu_getpid _getpid
+ #else
+ #include <dlfcn.h>
+ #include <unistd.h>
++#define fluxrec_zero_cpu_getpid getpid
+ #endif
++#include <stdatomic.h>
++#include <stdlib.h>
+ 
+ #include "thread.h"
+ 
+@@ -40,10 +45,35 @@
+ #include "hwcontext_internal.h"
+ #include "hwcontext_vulkan.h"
+ #include "mem.h"
++#include "getenv_utf8.h"
+ 
+ #include "vulkan.h"
+ #include "vulkan_loader.h"
+ 
++static const char *fluxrec_zero_cpu_audit_run_id(void)
++{
++    const char *run_id = getenv("FLUXREC_ZERO_CPU_AUDIT_RUN_ID");
++    return run_id && run_id[0] ? run_id : "unset";
++}
++
++static atomic_uint_fast64_t fluxrec_zero_cpu_audit_dmabuf_frames;
++static atomic_uint_fast64_t fluxrec_zero_cpu_audit_cuda_frames;
++static atomic_int fluxrec_zero_cpu_audit_exit_registered;
++static atomic_int fluxrec_zero_cpu_audit_live_import_logged;
++
++static void fluxrec_zero_cpu_audit_report_routes(void)
++{
++    av_log(NULL, AV_LOG_INFO,
++           "FLUXREC_ZERO_CPU_AUDIT event=process_frame_route_summary "
++           "dmabuf_vulkan_frames=%llu vulkan_cuda_frames=%llu "
++           "process_pid=%ld audit_run_id=%s\n",
++           (unsigned long long)atomic_load_explicit(
++               &fluxrec_zero_cpu_audit_dmabuf_frames, memory_order_relaxed),
++           (unsigned long long)atomic_load_explicit(
++               &fluxrec_zero_cpu_audit_cuda_frames, memory_order_relaxed),
++           (long)fluxrec_zero_cpu_getpid(), fluxrec_zero_cpu_audit_run_id());
++}
++
+ #if CONFIG_VAAPI
+ #include "hwcontext_vaapi.h"
+ #endif
+@@ -197,6 +227,11 @@
+ 
+     /* Set when physical device reports DEDICATED_ONLY for DMA-BUF export (try_export_flags) */
+     int export_requires_dedicated;
++
++    /* Diagnostic-only route audit; disabled unless explicitly requested. */
++    int fluxrec_zero_cpu_audit;
++    atomic_int fluxrec_zero_cpu_audit_import_logged;
++    atomic_int fluxrec_zero_cpu_audit_cuda_logged;
+ } VulkanFramesPriv;
+ 
+ typedef struct AVVkFrameInternal {
+@@ -2958,6 +2993,22 @@
+     int is_lone_dpb = ((hwctx->usage & VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR) ||
+                        ((hwctx->usage & VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR) &&
+                         !(hwctx->usage & VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR)));
++    char *audit_env = getenv_utf8("FLUXREC_FF_ZERO_CPU_AUDIT");
++
++    fp->fluxrec_zero_cpu_audit = audit_env && !strcmp(audit_env, "1");
++    freeenv_utf8(audit_env);
++    atomic_init(&fp->fluxrec_zero_cpu_audit_import_logged, 0);
++    atomic_init(&fp->fluxrec_zero_cpu_audit_cuda_logged, 0);
++    if (fp->fluxrec_zero_cpu_audit &&
++        !atomic_exchange_explicit(&fluxrec_zero_cpu_audit_exit_registered, 1,
++                                  memory_order_relaxed) &&
++        atexit(fluxrec_zero_cpu_audit_report_routes) != 0) {
++        av_log(hwfc, AV_LOG_ERROR,
++               "FLUXREC_ZERO_CPU_AUDIT event=summary_registration_failed "
++               "process_pid=%ld audit_run_id=%s\n",
++               (long)fluxrec_zero_cpu_getpid(), fluxrec_zero_cpu_audit_run_id());
++        return AVERROR(ENOMEM);
++    }
+ 
+     /* Defaults */
+     if (!hwctx->nb_layers)
+@@ -3666,8 +3717,21 @@
+ {
+     int err = 0;
+     AVVkFrame *f;
++    VulkanFramesPriv *fp = hwfc->hwctx;
+     const AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)src->data[0];
+ 
++    if (fp->fluxrec_zero_cpu_audit &&
++        (src->format != AV_PIX_FMT_DRM_PRIME || dst->format != AV_PIX_FMT_VULKAN ||
++         !(flags & AV_HWFRAME_MAP_DIRECT))) {
++        av_log(hwfc, AV_LOG_ERROR,
++               "FLUXREC_ZERO_CPU_AUDIT event=dmabuf_vulkan_rejected "
++               "reason=non_direct_or_unexpected_frame_map source_format=%s "
++               "destination_format=%s flags=0x%x process_pid=%ld audit_run_id=%s\n",
++               av_get_pix_fmt_name(src->format), av_get_pix_fmt_name(dst->format), flags,
++               (long)fluxrec_zero_cpu_getpid(), fluxrec_zero_cpu_audit_run_id());
++        return AVERROR(EINVAL);
++    }
++
+     if ((err = vulkan_map_from_drm_frame_desc(hwfc, &f, src, flags)))
+         return err;
+ 
+@@ -3685,6 +3749,32 @@
+     if (err < 0)
+         return err;
+ 
++    if (fp->fluxrec_zero_cpu_audit && src->pts != AV_NOPTS_VALUE) {
++        atomic_fetch_add_explicit(&fluxrec_zero_cpu_audit_dmabuf_frames, 1,
++                                  memory_order_relaxed);
++        if (!atomic_exchange_explicit(&fluxrec_zero_cpu_audit_live_import_logged, 1,
++                                      memory_order_relaxed))
++            av_log(hwfc, AV_LOG_INFO,
++                   "FLUXREC_ZERO_CPU_AUDIT event=dmabuf_vulkan_live_import status=ok "
++                   "pts=%lld source=AV_PIX_FMT_DRM_PRIME destination=AV_PIX_FMT_VULKAN "
++                   "process_pid=%ld audit_run_id=%s\n",
++                   (long long)src->pts, (long)fluxrec_zero_cpu_getpid(),
++                   fluxrec_zero_cpu_audit_run_id());
++    }
++
++    if (fp->fluxrec_zero_cpu_audit &&
++        !atomic_exchange_explicit(&fp->fluxrec_zero_cpu_audit_import_logged, 1,
++                                  memory_order_relaxed))
++        av_log(hwfc, AV_LOG_INFO,
++               "FLUXREC_ZERO_CPU_AUDIT event=dmabuf_vulkan_import status=ok "
++               "source=AV_PIX_FMT_DRM_PRIME destination=AV_PIX_FMT_VULKAN "
++               "api=VkImportMemoryFdInfoKHR handle=DMA_BUF layers=%d objects=%d "
++               "first_drm_fourcc=0x%08x cpu_mapping=none_in_importer "
++               "process_pid=%ld audit_run_id=%s\n",
++               desc->nb_layers, desc->nb_objects,
++               desc->nb_layers ? desc->layers[0].format : 0,
++               (long)fluxrec_zero_cpu_getpid(), fluxrec_zero_cpu_audit_run_id());
++
+     av_log(hwfc, AV_LOG_DEBUG, "Mapped DRM object to Vulkan!\n");
+ 
+     return 0;
+@@ -4880,6 +4970,25 @@
+     CudaFunctions *cu = cu_internal->cuda_dl;
+     CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS s_w_par[AV_NUM_DATA_POINTERS] = { 0 };
+     CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS s_s_par[AV_NUM_DATA_POINTERS] = { 0 };
++    AVHWFramesContext *src_fc = src->hw_frames_ctx
++        ? (AVHWFramesContext *)src->hw_frames_ctx->data : NULL;
++    AVHWFramesContext *dst_fc = dst->hw_frames_ctx
++        ? (AVHWFramesContext *)dst->hw_frames_ctx->data : NULL;
++
++    if (fp->fluxrec_zero_cpu_audit &&
++        (src->format != AV_PIX_FMT_VULKAN || dst->format != AV_PIX_FMT_CUDA ||
++         !src_fc || !dst_fc || src_fc->format != AV_PIX_FMT_VULKAN ||
++         dst_fc->format != AV_PIX_FMT_CUDA ||
++         src_fc->sw_format != AV_PIX_FMT_NV12 ||
++         dst_fc->sw_format != AV_PIX_FMT_NV12)) {
++        av_log(hwfc, AV_LOG_ERROR,
++               "FLUXREC_ZERO_CPU_AUDIT event=vulkan_to_cuda_rejected "
++               "reason=unexpected_frame_route source_format=%s destination_format=%s "
++               "process_pid=%ld audit_run_id=%s\n",
++               av_get_pix_fmt_name(src->format), av_get_pix_fmt_name(dst->format),
++               (long)fluxrec_zero_cpu_getpid(), fluxrec_zero_cpu_audit_run_id());
++        return AVERROR(EINVAL);
++    }
+ 
+     dst_f = (AVVkFrame *)src->data[0];
+     nb_images = ff_vk_count_images(dst_f);
+@@ -4927,9 +5036,23 @@
+         cpy.WidthInBytes = w * desc->comp[i].step;
+         cpy.Height = h;
+ 
++        if (fp->fluxrec_zero_cpu_audit &&
++            (cpy.srcMemoryType != CU_MEMORYTYPE_ARRAY ||
++             cpy.dstMemoryType != CU_MEMORYTYPE_DEVICE)) {
++            av_log(hwfc, AV_LOG_ERROR,
++                   "FLUXREC_ZERO_CPU_AUDIT event=vulkan_to_cuda_rejected "
++                   "reason=non_device_copy source_memory_type=%d destination_memory_type=%d "
++                   "process_pid=%ld audit_run_id=%s\n",
++                   cpy.srcMemoryType, cpy.dstMemoryType,
++                   (long)fluxrec_zero_cpu_getpid(), fluxrec_zero_cpu_audit_run_id());
++            err = AVERROR(ENOSYS);
++            goto fail;
++        }
++
+         err = CHECK_CU(cu->cuMemcpy2DAsync(&cpy, cuda_dev->stream));
+         if (err < 0)
+             goto fail;
++
+     }
+ 
+     err = CHECK_CU(cu->cuSignalExternalSemaphoresAsync(dst_int->cu_sem, s_s_par,
+@@ -4944,7 +5067,26 @@
+ 
+     av_log(hwfc, AV_LOG_VERBOSE, "Transferred Vulkan image to CUDA!\n");
+ 
+-    return prepare_frame(hwfc, &fp->upload_exec, dst_f, PREP_MODE_EXTERNAL_IMPORT);
++    err = prepare_frame(hwfc, &fp->upload_exec, dst_f, PREP_MODE_EXTERNAL_IMPORT);
++    if (err < 0)
++        return err;
++
++    if (fp->fluxrec_zero_cpu_audit && src->pts != AV_NOPTS_VALUE) {
++        atomic_fetch_add_explicit(&fluxrec_zero_cpu_audit_cuda_frames, 1,
++                                  memory_order_relaxed);
++        if (!atomic_exchange_explicit(&fp->fluxrec_zero_cpu_audit_cuda_logged, 1,
++                                      memory_order_relaxed))
++            av_log(hwfc, AV_LOG_INFO,
++                   "FLUXREC_ZERO_CPU_AUDIT event=vulkan_to_cuda_copy_submit status=ok "
++                   "source=AV_PIX_FMT_VULKAN destination=AV_PIX_FMT_CUDA "
++                   "source_sw_format=nv12 destination_sw_format=nv12 "
++                   "src_memory_type=CU_MEMORYTYPE_ARRAY dst_memory_type=CU_MEMORYTYPE_DEVICE "
++                   "planes=%d path=CUDA_stream process_pid=%ld audit_run_id=%s\n",
++                   planes, (long)fluxrec_zero_cpu_getpid(),
++                   fluxrec_zero_cpu_audit_run_id());
++    }
++
++    return 0;
+ 
+ fail:
+     CHECK_CU(cu->cuCtxPopCurrent(&dummy));

@@ -1,0 +1,90 @@
+#version 450
+
+// Direct SDR conversion for DRM_FORMAT_XRGB8888 / DRM_FORMAT_ARGB8888
+// (XR24 / AR24). The bound sampled view must return semantic R'G'B' in .rgb;
+// see gpu/shaders/README.md for the raw DRM and FFmpeg BGRA view mappings.
+//
+// Each invocation owns one 2x2 source block. It writes four full-resolution
+// luma codes and one interleaved CbCr code pair at half resolution.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D sourceImage;
+layout(set = 0, binding = 1, r8) writeonly uniform image2D yPlane;
+layout(set = 0, binding = 2, rg8) writeonly uniform image2D cbcrPlane;
+layout(std430, set = 0, binding = 3) writeonly buffer SourceSamples {
+    // Packed semantic RGB in low 24 bits and capture sequence tag in high 32.
+    uvec2 samples[];
+} sourceSamples;
+
+layout(push_constant) uniform ConvertParams {
+    // Full-resolution source/output extent. Must be even in both dimensions.
+    uvec2 sourceExtent;
+    uint probeEnabled;
+    uint probeTag;
+} params;
+
+vec3 toBt709Limited(vec3 rgbPrime)
+{
+    // BT.709 luma and normalized Cb/Cr difference signals.
+    // rgbPrime is nonlinear SDR R'G'B' in [0, 1], sampled without sRGB decode.
+    float yPrime = dot(rgbPrime, vec3(0.2126, 0.7152, 0.0722));
+    float cb = (rgbPrime.b - yPrime) / 1.8556;
+    float cr = (rgbPrime.r - yPrime) / 1.5748;
+    return vec3(yPrime, cb, cr);
+}
+
+float quantizeLuma(float yPrime)
+{
+    // 8-bit BT.709 studio swing: Y' = 16..235.
+    return floor(clamp(16.0 + 219.0 * yPrime, 16.0, 235.0) + 0.5);
+}
+
+float quantizeChroma(float chroma)
+{
+    // 8-bit BT.709 studio swing: Cb/Cr = 16..240, neutral = 128.
+    return floor(clamp(128.0 + 224.0 * chroma, 16.0, 240.0) + 0.5);
+}
+
+void main()
+{
+    uvec2 chromaPos = gl_GlobalInvocationID.xy;
+    uvec2 chromaExtent = params.sourceExtent / 2u;
+    if (any(greaterThanEqual(chromaPos, chromaExtent)))
+        return;
+
+    uvec2 sourcePos = chromaPos * 2u;
+    ivec2 p00 = ivec2(sourcePos);
+    ivec2 p10 = p00 + ivec2(1, 0);
+    ivec2 p01 = p00 + ivec2(0, 1);
+    ivec2 p11 = p00 + ivec2(1, 1);
+
+    // texelFetch avoids filtering and preserves the source pixel grid.
+    vec3 rgb00 = texelFetch(sourceImage, p00, 0).rgb;
+    vec3 c00 = toBt709Limited(rgb00);
+    vec3 c10 = toBt709Limited(texelFetch(sourceImage, p10, 0).rgb);
+    vec3 c01 = toBt709Limited(texelFetch(sourceImage, p01, 0).rgb);
+    vec3 c11 = toBt709Limited(texelFetch(sourceImage, p11, 0).rgb);
+
+    imageStore(yPlane, p00, vec4(quantizeLuma(c00.x) / 255.0, 0.0, 0.0, 1.0));
+    imageStore(yPlane, p10, vec4(quantizeLuma(c10.x) / 255.0, 0.0, 0.0, 1.0));
+    imageStore(yPlane, p01, vec4(quantizeLuma(c01.x) / 255.0, 0.0, 0.0, 1.0));
+    imageStore(yPlane, p11, vec4(quantizeLuma(c11.x) / 255.0, 0.0, 0.0, 1.0));
+
+    // Average unquantized chroma over the corresponding 2x2 source footprint.
+    // RG stores NV12 byte order: Cb (U) followed by Cr (V).
+    vec2 cbcr = (c00.yz + c10.yz + c01.yz + c11.yz) * 0.25;
+    imageStore(cbcrPlane, ivec2(chromaPos),
+               vec4(quantizeChroma(cbcr.x) / 255.0,
+                    quantizeChroma(cbcr.y) / 255.0, 0.0, 1.0));
+
+    // On opt-in diagnostics, each workgroup records the source RGB sample it
+    // already fetched for conversion near the center of its 32x32 source tile.
+    // The tag lets the host detect workgroups that failed to write this frame.
+    // This adds no second image read or dispatch.
+    if (params.probeEnabled != 0u && gl_LocalInvocationIndex == 136u) {
+        uint sampleIndex = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        uvec3 rgb8 = uvec3(round(clamp(rgb00, vec3(0.0), vec3(1.0)) * 255.0));
+        uint packedRgb = rgb8.r | (rgb8.g << 8u) | (rgb8.b << 16u);
+        sourceSamples.samples[sampleIndex] = uvec2(packedRgb, params.probeTag);
+    }
+}

@@ -1,0 +1,178 @@
+--- a/libavcodec/vulkan_encode.h
++++ b/libavcodec/vulkan_encode.h
+@@ -195,6 +195,17 @@
+     AVVulkanDeviceQueueFamily *qf_enc;
+     FFVkExecPool enc_pool;
+ 
++    struct {
++        VkQueryPool pool;
++        int enabled;
++        uint32_t timestamp_valid_bits;
++        double timestamp_period_ns;
++        uint64_t batch_samples;
++        uint64_t batch_total_ns;
++        uint64_t batch_min_ns;
++        uint64_t batch_max_ns;
++    } device_timing;
++
+     FFHWBaseEncodePicture *slots[32];
+ 
+     AVBufferRef *prev_buf_ref;
+--- a/libavcodec/vulkan_encode.c
++++ b/libavcodec/vulkan_encode.c
+@@ -18,10 +18,12 @@
+ 
+ #include "libavutil/mem.h"
+ #include "libavutil/avassert.h"
++#include "libavutil/getenv_utf8.h"
+ #include "vulkan_encode.h"
+ #include "config.h"
+ 
+ #include "libavutil/vulkan_loader.h"
++#include <inttypes.h>
+ 
+ const AVCodecHWConfigInternal *const ff_vulkan_encode_hw_configs[] = {
+     HW_CONFIG_ENCODER_FRAMES(VULKAN, VULKAN),
+@@ -36,6 +38,10 @@
+     /* Wait on and free execution pool */
+     ff_vk_exec_pool_free(s, &ctx->enc_pool);
+ 
++    if (ctx->device_timing.pool)
++        vk->DestroyQueryPool(s->hwctx->act_dev, ctx->device_timing.pool,
++                             s->hwctx->alloc);
++
+     /* Destroy the session params */
+     if (ctx->session_params)
+         vk->DestroyVideoSessionParametersKHR(s->hwctx->act_dev,
+@@ -342,6 +348,10 @@
+     ff_vk_exec_start(&ctx->s, exec);
+     cmd_buf = exec->buf;
+ 
++    if (ctx->device_timing.enabled)
++        vk->CmdResetQueryPool(cmd_buf, ctx->device_timing.pool,
++                              2 * exec->idx, 2);
++
+     /* Output packet buffer */
+     err = ff_vk_exec_add_dep_buf(&ctx->s, exec, &vp->pkt_buf, 1, 1);
+     if (err < 0)
+@@ -423,7 +433,13 @@
+ 
+     /* Encode */
+     vk->CmdBeginQuery(cmd_buf, ctx->enc_pool.query_pool, exec->query_idx + 0, 0);
++    if (ctx->device_timing.enabled)
++        vk->CmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              ctx->device_timing.pool, 2 * exec->idx);
+     vk->CmdEncodeVideoKHR(cmd_buf, &encode_info);
++    if (ctx->device_timing.enabled)
++        vk->CmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              ctx->device_timing.pool, 2 * exec->idx + 1);
+     vk->CmdEndQuery(cmd_buf, ctx->enc_pool.query_pool, exec->query_idx + 0);
+ 
+     /* End encoding */
+@@ -472,6 +488,53 @@
+ 
+     vulkan_encode_wait(avctx, base_pic);
+ 
++    if (ctx->device_timing.enabled) {
++        uint64_t timestamps[2];
++        uint64_t ticks;
++        long double elapsed_ns;
++
++        ret = ctx->s.vkfn.GetQueryPoolResults(ctx->s.hwctx->act_dev,
++                                              ctx->device_timing.pool,
++                                              2 * vp->exec->idx, 2,
++                                              sizeof(timestamps), timestamps,
++                                              sizeof(uint64_t),
++                                              VK_QUERY_RESULT_64_BIT);
++        if (ret == VK_SUCCESS) {
++            ticks = timestamps[1] - timestamps[0];
++            if (ctx->device_timing.timestamp_valid_bits < 64)
++                ticks &= (UINT64_C(1) << ctx->device_timing.timestamp_valid_bits) - 1;
++            elapsed_ns = (long double)ticks * ctx->device_timing.timestamp_period_ns;
++            if (elapsed_ns >= 0.0L && elapsed_ns <= UINT64_MAX) {
++                uint64_t elapsed = (uint64_t)elapsed_ns;
++                ctx->device_timing.batch_samples++;
++                ctx->device_timing.batch_total_ns += elapsed;
++                ctx->device_timing.batch_min_ns =
++                    FFMIN(ctx->device_timing.batch_min_ns, elapsed);
++                ctx->device_timing.batch_max_ns =
++                    FFMAX(ctx->device_timing.batch_max_ns, elapsed);
++                if (ctx->device_timing.batch_samples == 360) {
++                    av_log(avctx, AV_LOG_INFO,
++                           "FLUXREC_FF_VK_DEVICE_TIMING stage=vulkan_encode codec=%s samples=%" PRIu64
++                           " mean_ns=%" PRIu64 " min_ns=%" PRIu64 " max_ns=%" PRIu64 "\n",
++                           avctx->codec->name, ctx->device_timing.batch_samples,
++                           ctx->device_timing.batch_total_ns /
++                               ctx->device_timing.batch_samples,
++                           ctx->device_timing.batch_min_ns,
++                           ctx->device_timing.batch_max_ns);
++                    ctx->device_timing.batch_samples = 0;
++                    ctx->device_timing.batch_total_ns = 0;
++                    ctx->device_timing.batch_min_ns = UINT64_MAX;
++                    ctx->device_timing.batch_max_ns = 0;
++                }
++            }
++        } else {
++            av_log(avctx, AV_LOG_WARNING,
++                   "Unable to read completed Vulkan encode timestamps: %s; timing disabled\n",
++                   ff_vk_ret2str(ret));
++            ctx->device_timing.enabled = 0;
++        }
++    }
++
+     ret = ff_vk_exec_get_query(&ctx->s, vp->exec, (void **)&query_data, 0);
+     if (ret == VK_NOT_READY) {
+         av_log(avctx, AV_LOG_ERROR, "Unable to perform query: %s!\n",
+@@ -821,6 +884,23 @@
+     if (err < 0)
+         return err;
+ 
++    char *timing_env = getenv_utf8("FLUXREC_FF_VK_DEVICE_TIMING");
++    ctx->device_timing.enabled = timing_env && !strcmp(timing_env, "1");
++    freeenv_utf8(timing_env);
++    if (ctx->device_timing.enabled) {
++        ctx->device_timing.timestamp_valid_bits =
++            s->qf_props[ctx->qf_enc->idx].queueFamilyProperties.timestampValidBits;
++        ctx->device_timing.timestamp_period_ns =
++            s->props.properties.limits.timestampPeriod;
++        if (!ctx->device_timing.timestamp_valid_bits ||
++            ctx->device_timing.timestamp_valid_bits > 64 ||
++            ctx->device_timing.timestamp_period_ns <= 0.0) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "Vulkan encode device timing requested, but queue timestamps are unavailable; disabled\n");
++            ctx->device_timing.enabled = 0;
++        }
++    }
++
+     /* Set tuning */
+     ctx->usage_info = (VkVideoEncodeUsageInfoKHR) {
+         .sType             = VK_STRUCTURE_TYPE_VIDEO_ENCODE_USAGE_INFO_KHR,
+@@ -897,6 +977,28 @@
+     if (err < 0)
+         return err;
+ 
++    if (ctx->device_timing.enabled) {
++        VkQueryPoolCreateInfo timing_pool_info = {
++            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
++            .queryType = VK_QUERY_TYPE_TIMESTAMP,
++            .queryCount = 2 * ctx->enc_pool.pool_size,
++        };
++        ret = vk->CreateQueryPool(s->hwctx->act_dev, &timing_pool_info,
++                                  s->hwctx->alloc, &ctx->device_timing.pool);
++        if (ret != VK_SUCCESS) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "Unable to create Vulkan encode timestamp pool: %s; timing disabled\n",
++                   ff_vk_ret2str(ret));
++            ctx->device_timing.enabled = 0;
++        } else {
++            ctx->device_timing.batch_min_ns = UINT64_MAX;
++            av_log(avctx, AV_LOG_INFO,
++                   "Vulkan encode device timing enabled for %s (period %.3f ns, %u valid bits); result reads follow the existing encode fence\n",
++                   avctx->codec->name, ctx->device_timing.timestamp_period_ns,
++                   ctx->device_timing.timestamp_valid_bits);
++        }
++    }
++
+     if (ctx->opts.quality > ctx->enc_caps.maxQualityLevels) {
+         av_log(avctx, AV_LOG_ERROR, "Invalid quality level %i: allowed range is "
+                                     "0 to %i\n",

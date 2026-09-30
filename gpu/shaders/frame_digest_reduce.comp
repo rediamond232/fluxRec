@@ -1,0 +1,59 @@
+#version 450
+
+// Second pass of the optional captured-frame identity digest.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer PartialDigests {
+    uvec4 values[];
+} partialDigests;
+
+layout(std430, set = 0, binding = 1) writeonly buffer FrameDigest {
+    uvec4 words;
+} frameDigest;
+
+layout(push_constant) uniform FrameDigestReduceParams {
+    // x = width, y = height, z = number of partial records, w = pixel count.
+    uvec4 values;
+} params;
+
+shared uvec4 workgroupSums[128];
+
+uvec4 avalanche(uvec4 value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+void main()
+{
+    uint localIndex = gl_LocalInvocationID.x;
+    uvec4 value = uvec4(0u);
+
+    // Stride over all workgroup results; for 2560x1440 this is 225 records
+    // per lane (28,800 records / 128 lanes).
+    for (uint i = localIndex; i < params.values.z; i += 128u)
+        value += partialDigests.values[i];
+
+    workgroupSums[localIndex] = value;
+    barrier();
+
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (localIndex < stride)
+            workgroupSums[localIndex] += workgroupSums[localIndex + stride];
+        barrier();
+    }
+
+    if (localIndex == 0u) {
+        uvec4 frameDomain = uvec4(params.values.w,
+                                  params.values.x,
+                                  params.values.y,
+                                  params.values.z);
+        uvec4 salts = uvec4(0xa4093822u, 0x299f31d0u,
+                            0x082efa98u, 0xec4e6c89u);
+        frameDigest.words = avalanche(workgroupSums[0] ^ frameDomain ^ salts);
+    }
+}

@@ -1,0 +1,70 @@
+--- a/libavutil/vulkan_functions.h
++++ b/libavutil/vulkan_functions.h
+@@ -204,6 +204,7 @@
+     MACRO(1, 1, FF_VK_EXT_NO_FLAG,              CmdBeginQuery)                             \
+     MACRO(1, 1, FF_VK_EXT_NO_FLAG,              CmdEndQuery)                               \
+     MACRO(1, 1, FF_VK_EXT_NO_FLAG,              CmdResetQueryPool)                         \
++    MACRO(1, 1, FF_VK_EXT_NO_FLAG,              CmdWriteTimestamp)                         \
+     MACRO(1, 1, FF_VK_EXT_NO_FLAG,              DestroyQueryPool)                          \
+                                                                                            \
+     /* sync2 */                                                                            \
+--- a/libavutil/vulkan.h
++++ b/libavutil/vulkan.h
+@@ -112,6 +112,7 @@
+     uint32_t idx;
+     const struct FFVkExecPool *parent;
+     int had_submission;
++    int query_data_valid;
+ 
+     /* Queue for the execution context */
+     VkQueue queue;
+@@ -260,6 +261,7 @@
+ 
+     VkQueryPool query_pool;
+     void *query_data;
++    VkQueryType query_type;
+     int query_results;
+     int query_statuses;
+     int query_64bit;
+--- a/libavutil/vulkan.c
++++ b/libavutil/vulkan.c
+@@ -366,6 +366,9 @@
+     VkCommandPoolCreateInfo cqueue_create;
+     VkCommandBufferAllocateInfo cbuf_create;
+ 
++    pool->query_type = query_type;
++    pool->query_64bit = query_64bit;
++
+     const VkQueryPoolVideoEncodeFeedbackCreateInfoKHR *ef = NULL;
+ 
+     atomic_init(&pool->idx, 0);
+@@ -456,6 +459,8 @@
+         } else if (query_type == VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR) {
+             pool->query_status_stride = 1;
+             pool->query_results = 0;
++        } else if (query_type == VK_QUERY_TYPE_TIMESTAMP) {
++            pool->query_statuses = 0;
+         }
+ 
+         pool->qd_size = (pool->query_results + pool->query_statuses)*(query_64bit ? 8 : 4);
+@@ -590,6 +595,20 @@
+ 
+     /* Wait for the fence to be signalled */
+     vk->WaitForFences(s->hwctx->act_dev, 1, &e->fence, VK_TRUE, UINT64_MAX);
++    e->query_data_valid = 0;
++    if (pool->query_type == VK_QUERY_TYPE_TIMESTAMP && e->had_submission) {
++        ret = vk->GetQueryPoolResults(s->hwctx->act_dev, pool->query_pool,
++                                      e->query_idx, pool->nb_queries,
++                                      pool->qd_size, e->query_data,
++                                      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
++        if (ret == VK_SUCCESS) {
++            e->query_data_valid = 1;
++        } else {
++            av_log(s, AV_LOG_WARNING,
++                   "Unable to read completed Vulkan timestamp queries: %s\n",
++                   ff_vk_ret2str(ret));
++        }
++    }
+     vk->ResetFences(s->hwctx->act_dev, 1, &e->fence);
+ 
+     /* Discard queue dependencies */

@@ -1,0 +1,69 @@
+#version 450
+
+// First pass of the optional captured-frame identity digest.
+// Every visible RGB texel contributes to one of four 32-bit digest lanes.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D sourceImage;
+layout(std430, set = 0, binding = 1) writeonly buffer PartialDigests {
+    uvec4 values[];
+} partialDigests;
+
+layout(push_constant) uniform FrameDigestParams {
+    uvec2 sourceExtent;
+} params;
+
+shared uvec4 workgroupSums[128];
+
+uvec4 avalanche(uvec4 value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+uvec4 hashPixel(uvec3 rgb8, uvec2 pixelPosition)
+{
+    // Hash R'G'B' and coordinates so pixel permutations change the result.
+    // Four distinct salts domain-separate the 32-bit lanes of the digest.
+    uint packedRgb = rgb8.r | (rgb8.g << 8u) | (rgb8.b << 16u);
+    uint coordinateMix = pixelPosition.x * 0x9e3779b9u
+                       + pixelPosition.y * 0x85ebca6bu;
+    uvec4 salted = uvec4(packedRgb ^ coordinateMix)
+                 + uvec4(0x243f6a88u, 0x85a308d3u,
+                         0x13198a2eu, 0x03707344u);
+    return avalanche(salted);
+}
+
+void main()
+{
+    uint pixelIndex = gl_GlobalInvocationID.x;
+    uint pixelCount = params.sourceExtent.x * params.sourceExtent.y;
+    uvec4 value = uvec4(0u);
+
+    if (pixelIndex < pixelCount) {
+        uvec2 position = uvec2(pixelIndex % params.sourceExtent.x,
+                               pixelIndex / params.sourceExtent.x);
+        vec3 sampledRgb = texelFetch(sourceImage, ivec2(position), 0).rgb;
+        uvec3 rgb8 = uvec3(floor(sampledRgb * 255.0 + 0.5));
+        value = hashPixel(rgb8, position);
+    }
+
+    uint localIndex = gl_LocalInvocationID.x;
+    workgroupSums[localIndex] = value;
+    barrier();
+
+    // Modular uint32 addition makes this tree reduction deterministic and
+    // associative, independent of workgroup scheduling.
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (localIndex < stride)
+            workgroupSums[localIndex] += workgroupSums[localIndex + stride];
+        barrier();
+    }
+
+    if (localIndex == 0u)
+        partialDigests.values[gl_WorkGroupID.x] = workgroupSums[0];
+}

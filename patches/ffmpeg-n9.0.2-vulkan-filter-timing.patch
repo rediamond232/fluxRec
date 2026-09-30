@@ -1,0 +1,167 @@
+--- a/libavfilter/vulkan_filter.h
++++ b/libavfilter/vulkan_filter.h
+@@ -25,6 +25,16 @@
+ 
+ #include "libavutil/vulkan.h"
+ 
++typedef struct FFVkFilterTiming {
++    int enabled;
++    uint32_t timestamp_valid_bits;
++    double timestamp_period_ns;
++    uint64_t batch_samples;
++    uint64_t batch_total_ns;
++    uint64_t batch_min_ns;
++    uint64_t batch_max_ns;
++} FFVkFilterTiming;
++
+ /**
+  * General lavfi IO functions
+  */
+@@ -42,7 +52,8 @@
+ /**
+  * Submit a compute shader with a zero/one input and single out for execution.
+  */
+-int ff_vk_filter_process_simple(FFVulkanContext *vkctx, FFVkExecPool *e,
++int ff_vk_filter_process_simple(AVFilterContext *avctx, FFVulkanContext *vkctx,
++                                FFVkExecPool *e, FFVkFilterTiming *timing,
+                                 FFVulkanShader *shd, AVFrame *out_f, AVFrame *in_f,
+                                 VkSampler sampler, uint32_t wgc_z,
+                                 void *push_src, size_t push_size);
+--- a/libavfilter/vf_scale_vulkan.c
++++ b/libavfilter/vf_scale_vulkan.c
+@@ -24,6 +24,7 @@
+ #include "filters.h"
+ #include "colorspace.h"
+ #include "video.h"
++#include "libavutil/getenv_utf8.h"
+ #include "libswscale/swscale.h"
+ 
+ extern const unsigned char ff_scale_comp_spv_data[];
+@@ -60,6 +61,7 @@
+ 
+     int initialized;
+     FFVkExecPool e;
++    FFVkFilterTiming device_timing;
+     AVVulkanDeviceQueueFamily *qf;
+     FFVulkanShader shd;
+     VkSampler sampler;
+@@ -115,7 +117,34 @@
+         }
+     }
+ 
+-    RET(ff_vk_exec_pool_init(vkctx, s->qf, &s->e, s->qf->num*4, 0, 0, 0, NULL));
++    char *timing_env = getenv_utf8("FLUXREC_FF_VK_DEVICE_TIMING");
++    s->device_timing.enabled = timing_env && !strcmp(timing_env, "1");
++    freeenv_utf8(timing_env);
++    if (s->device_timing.enabled) {
++        s->device_timing.timestamp_valid_bits =
++            vkctx->qf_props[s->qf->idx].queueFamilyProperties.timestampValidBits;
++        s->device_timing.timestamp_period_ns =
++            vkctx->props.properties.limits.timestampPeriod;
++        if (!s->device_timing.timestamp_valid_bits ||
++            s->device_timing.timestamp_valid_bits > 64 ||
++            s->device_timing.timestamp_period_ns <= 0.0) {
++            av_log(ctx, AV_LOG_WARNING,
++                   "Vulkan device timing requested, but compute queue timestamps are unavailable; disabled\n");
++            s->device_timing.enabled = 0;
++        }
++    }
++
++    RET(ff_vk_exec_pool_init(vkctx, s->qf, &s->e, s->qf->num*4,
++                             s->device_timing.enabled ? 2 : 0,
++                             s->device_timing.enabled ? VK_QUERY_TYPE_TIMESTAMP : 0,
++                             s->device_timing.enabled, NULL));
++    if (s->device_timing.enabled) {
++        s->device_timing.batch_min_ns = UINT64_MAX;
++        av_log(ctx, AV_LOG_INFO,
++               "Vulkan device timing enabled for %s (period %.3f ns, %u valid bits); results are read after the existing fence when an execution slot is reused\n",
++               ctx->name, s->device_timing.timestamp_period_ns,
++               s->device_timing.timestamp_valid_bits);
++    }
+ 
+     RET(ff_vk_init_sampler(vkctx, &s->sampler, 0, sampler_mode));
+ 
+@@ -275,7 +304,8 @@
+                 RET(init_filter(ctx, in));
+         }
+ 
+-        RET(ff_vk_filter_process_simple(&s->vkctx, &s->e, &s->shd, out, in,
++        RET(ff_vk_filter_process_simple(ctx, &s->vkctx, &s->e,
++                                        &s->device_timing, &s->shd, out, in,
+                                         s->sampler, 1, &s->opts, sizeof(s->opts)));
+     } else {
+         err = sws_scale_frame(s->sws, out, in);
+--- a/libavfilter/vulkan_filter.c
++++ b/libavfilter/vulkan_filter.c
+@@ -22,6 +22,7 @@
+ #include "vulkan_filter.h"
+ #include "libavutil/vulkan_loader.h"
+ #include "libavutil/getenv_utf8.h"
++#include <inttypes.h>
+ 
+ int ff_vk_filter_init_context(AVFilterContext *avctx, FFVulkanContext *s,
+                               AVBufferRef *frames_ref,
+@@ -240,7 +241,8 @@
+     return 0;
+ }
+ 
+-int ff_vk_filter_process_simple(FFVulkanContext *vkctx, FFVkExecPool *e,
++int ff_vk_filter_process_simple(AVFilterContext *avctx, FFVulkanContext *vkctx,
++                                FFVkExecPool *e, FFVkFilterTiming *timing,
+                                 FFVulkanShader *shd, AVFrame *out_f, AVFrame *in_f,
+                                 VkSampler sampler, uint32_t wgc_z,
+                                 void *push_src, size_t push_size)
+@@ -260,6 +262,33 @@
+     FFVkExecContext *exec = ff_vk_exec_get(vkctx, e);
+     ff_vk_exec_start(vkctx, exec);
+ 
++    if (timing && timing->enabled && exec->query_data_valid) {
++        const uint64_t *timestamps = exec->query_data;
++        uint64_t ticks = timestamps[1] - timestamps[0];
++        if (timing->timestamp_valid_bits < 64)
++            ticks &= (UINT64_C(1) << timing->timestamp_valid_bits) - 1;
++        long double elapsed_ns = (long double)ticks * timing->timestamp_period_ns;
++        if (elapsed_ns >= 0.0L && elapsed_ns <= UINT64_MAX) {
++            uint64_t elapsed = (uint64_t)elapsed_ns;
++            timing->batch_samples++;
++            timing->batch_total_ns += elapsed;
++            timing->batch_min_ns = FFMIN(timing->batch_min_ns, elapsed);
++            timing->batch_max_ns = FFMAX(timing->batch_max_ns, elapsed);
++            if (timing->batch_samples == 360) {
++                av_log(avctx, AV_LOG_INFO,
++                       "FLUXREC_FF_VK_DEVICE_TIMING stage=%s samples=%" PRIu64
++                       " mean_ns=%" PRIu64 " min_ns=%" PRIu64 " max_ns=%" PRIu64 "\n",
++                       avctx->name, timing->batch_samples,
++                       timing->batch_total_ns / timing->batch_samples,
++                       timing->batch_min_ns, timing->batch_max_ns);
++                timing->batch_samples = 0;
++                timing->batch_total_ns = 0;
++                timing->batch_min_ns = UINT64_MAX;
++                timing->batch_max_ns = 0;
++            }
++        }
++    }
++
+     RET(ff_vk_exec_add_dep_frame(vkctx, exec, out_f,
+                                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT));
+@@ -304,11 +333,19 @@
+             .imageMemoryBarrierCount = nb_img_bar,
+         });
+ 
++    if (timing && timing->enabled)
++        vk->CmdWriteTimestamp(exec->buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              e->query_pool, exec->query_idx);
++
+     vk->CmdDispatch(exec->buf,
+                     FFALIGN(vkctx->output_width,  shd->lg_size[0])/shd->lg_size[0],
+                     FFALIGN(vkctx->output_height, shd->lg_size[1])/shd->lg_size[1],
+                     wgc_z);
+ 
++    if (timing && timing->enabled)
++        vk->CmdWriteTimestamp(exec->buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              e->query_pool, exec->query_idx + 1);
++
+     err = ff_vk_exec_submit(vkctx, exec);
+     if (err < 0)
+         return err;

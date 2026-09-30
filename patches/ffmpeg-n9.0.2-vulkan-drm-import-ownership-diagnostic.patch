@@ -1,0 +1,83 @@
+--- a/libavutil/hwcontext_vulkan.c
++++ b/libavutil/hwcontext_vulkan.c
+@@ -2525,8 +2525,11 @@
+     VkAccessFlags2 new_access;
+     switch_new_props(pmode, &new_layout, &new_access);
+ 
++    FFVkExecContext *exec = ff_vk_exec_get(&p->vkctx, ectx);
+     uint32_t dst_qf = p->nb_img_qfs > 1 ? VK_QUEUE_FAMILY_IGNORED : p->img_qfs[0];
+     VkPipelineStageFlagBits2 src_stage = VK_PIPELINE_STAGE_2_NONE;
++    if (pmode == PREP_MODE_EXTERNAL_IMPORT)
++        dst_qf = exec->qf;
+     if (pmode == PREP_MODE_EXTERNAL_EXPORT) {
+         dst_qf     = VK_QUEUE_FAMILY_EXTERNAL_KHR;
+         src_stage  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+@@ -2543,9 +2546,7 @@
+         .hw_frames_ctx = &tmp_ref,
+     };
+ 
+-    VkCommandBuffer cmd_buf;
+-    FFVkExecContext *exec = ff_vk_exec_get(&p->vkctx, ectx);
+-    cmd_buf = exec->buf;
++    VkCommandBuffer cmd_buf = exec->buf;
+     ff_vk_exec_start(&p->vkctx, exec);
+ 
+     err = ff_vk_exec_add_dep_frame(&p->vkctx, exec, &tmp_frame,
+@@ -3215,7 +3216,37 @@
+ #if CONFIG_LIBDRM
+ static void vulkan_unmap_from_drm(AVHWFramesContext *hwfc, HWMapDescriptor *hwmap)
+ {
+-    vulkan_frame_free(hwfc, hwmap->priv);
++    AVVkFrame *frame = hwmap->priv;
++    VulkanFramesPriv *fp = hwfc->hwctx;
++    VulkanDevicePriv *p = hwfc->device_ctx->hwctx;
++    const int nb_images = ff_vk_count_images(frame);
++    int all_external = 1;
++
++    /* Concurrent Vulkan image sharing does not remove the external API
++     * ownership handoff. FFmpeg's ordinary concurrent-image barriers can
++     * leave queue_family as IGNORED, so restore the family of this release
++     * submission. This diagnostic path assumes the DRM source is only used
++     * on the device's compute queue family. */
++    for (int i = 0; i < nb_images; i++) {
++        if (frame->queue_family[i] != VK_QUEUE_FAMILY_EXTERNAL)
++            all_external = 0;
++    }
++
++    if (!all_external) {
++        for (int i = 0; i < nb_images; i++) {
++            if (frame->queue_family[i] == VK_QUEUE_FAMILY_IGNORED)
++                frame->queue_family[i] = p->compute_qf->idx;
++        }
++
++        int err = switch_layout(hwfc, &fp->compute_exec, frame,
++                                PREP_MODE_EXTERNAL_EXPORT);
++        if (err < 0)
++            av_log(hwfc, AV_LOG_WARNING,
++                   "Failed to release imported DRM frame to external owner: %s\n",
++                   av_err2str(err));
++    }
++
++    vulkan_frame_free(hwfc, frame);
+ }
+ 
+ static const struct {
+@@ -3636,7 +3667,7 @@
+                             ((flags & AV_HWFRAME_MAP_WRITE) ?
+                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT : 0x0),
+                             VK_IMAGE_LAYOUT_GENERAL,
+-                            p->nb_img_qfs > 1 ? VK_QUEUE_FAMILY_IGNORED : p->img_qfs[0]);
++                            exec->qf);
+ 
+         vk->CmdPipelineBarrier2(cmd_buf, &(VkDependencyInfo) {
+                 .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+@@ -3653,7 +3684,8 @@
+         AVVkFrame *f = (AVVkFrame *)dst->data[0];
+         av_log(hwctx, AV_LOG_WARNING, "No support for synchronization when importing DMA-BUFs, "
+                                       "image may be corrupted.\n");
+-        err = prepare_frame(hwfc, &fp->compute_exec, f, PREP_MODE_EXTERNAL_IMPORT);
++        err = switch_layout(hwfc, &fp->compute_exec, f,
++                            PREP_MODE_EXTERNAL_IMPORT);
+         if (err)
+             return err;
+     }

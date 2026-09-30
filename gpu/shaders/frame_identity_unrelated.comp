@@ -1,0 +1,57 @@
+#version 450
+
+// Diagnostic workload for separating source reads from same-queue compute
+// delay. It deliberately has no image descriptor and never accesses a frame.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer WorkloadPartials {
+    uvec4 values[];
+} workloadPartials;
+
+layout(push_constant) uniform WorkloadParams {
+    uvec2 sourceExtent;
+    uint iterations;
+    uint reserved;
+} params;
+
+shared uvec4 workgroupSums[128];
+
+uvec4 avalanche(uvec4 value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+void main()
+{
+    uint pixelIndex = gl_GlobalInvocationID.x;
+    uint pixelCount = params.sourceExtent.x * params.sourceExtent.y;
+    uvec4 value = uvec4(0u);
+
+    if (pixelIndex < pixelCount) {
+        value = uvec4(pixelIndex) + uvec4(0x243f6a88u, 0x85a308d3u,
+                                          0x13198a2eu, 0x03707344u);
+        for (uint i = 0u; i < params.iterations; ++i) {
+            value += uvec4(i * 0x9e3779b9u, i * 0x85ebca6bu,
+                           i * 0xc2b2ae35u, i * 0x27d4eb2fu);
+            value = avalanche(value);
+        }
+    }
+
+    uint localIndex = gl_LocalInvocationID.x;
+    workgroupSums[localIndex] = value;
+    barrier();
+
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (localIndex < stride)
+            workgroupSums[localIndex] += workgroupSums[localIndex + stride];
+        barrier();
+    }
+
+    if (localIndex == 0u)
+        workloadPartials.values[gl_WorkGroupID.x] = workgroupSums[0];
+}

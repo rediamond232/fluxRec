@@ -1,0 +1,77 @@
+--- a/libavfilter/vf_blackdetect_vulkan.c
++++ b/libavfilter/vf_blackdetect_vulkan.c
+@@ -66,8 +66,9 @@
+     const int plane = s->alpha ? 3 : 0;
+ 
+     const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(s->vkctx.input_format);
+-    if (pixdesc->flags & AV_PIX_FMT_FLAG_RGB) {
+-        av_log(ctx, AV_LOG_ERROR, "RGB inputs are not supported\n");
++    const int rgb_input = !!(pixdesc->flags & AV_PIX_FMT_FLAG_RGB);
++    if (rgb_input && s->alpha) {
++        av_log(ctx, AV_LOG_ERROR, "RGB black detection does not support alpha mode\n");
+         return AVERROR(ENOTSUP);
+     }
+ 
+@@ -80,9 +81,10 @@
+ 
+     RET(ff_vk_exec_pool_init(vkctx, s->qf, &s->e, s->qf->num*4, 0, 0, 0, NULL));
+ 
+-    SPEC_LIST_CREATE(sl, 2, 2*sizeof(uint32_t))
++    SPEC_LIST_CREATE(sl, 3, 3*sizeof(uint32_t))
+     SPEC_LIST_ADD(sl, 0, 32, plane);
+     SPEC_LIST_ADD(sl, 1, 32, SLICES);
++    SPEC_LIST_ADD(sl, 2, 32, rgb_input);
+ 
+     ff_vk_shader_load(&s->shd, VK_SHADER_STAGE_COMPUTE_BIT, sl,
+                       (int []) { 32, 32, 1 }, 0);
+@@ -345,6 +347,7 @@
+     BlackDetectVulkanContext *s = ctx->priv;
+     FFVulkanContext *vkctx = &s->vkctx;
+     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(vkctx->input_format);
++    const int rgb = !!(desc->flags & AV_PIX_FMT_FLAG_RGB);
+ 
+     if (s->alpha && !(desc->flags & AV_PIX_FMT_FLAG_ALPHA)) {
+         av_log(ctx, AV_LOG_ERROR, "Input format %s does not have an alpha channel\n",
+@@ -352,9 +355,14 @@
+         return AVERROR(EINVAL);
+     }
+ 
+-    if (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_XYZ) ||
+-        !(desc->flags & AV_PIX_FMT_FLAG_PLANAR)) {
+-        av_log(ctx, AV_LOG_ERROR, "Input format %s is not planar YUV\n",
++    if ((desc->flags & AV_PIX_FMT_FLAG_XYZ) ||
++        (!rgb && !(desc->flags & AV_PIX_FMT_FLAG_PLANAR)) ||
++        (rgb && vkctx->input_format != AV_PIX_FMT_BGRA &&
++         vkctx->input_format != AV_PIX_FMT_BGR0 &&
++         vkctx->input_format != AV_PIX_FMT_RGBA &&
++         vkctx->input_format != AV_PIX_FMT_RGB0)) {
++        av_log(ctx, AV_LOG_ERROR,
++               "Input format %s is not supported planar YUV or packed RGB\n",
+                av_get_pix_fmt_name(vkctx->input_format));
+         return AVERROR(EINVAL);
+     }
+--- a/libavfilter/vulkan/blackdetect.comp.glsl
++++ b/libavfilter/vulkan/blackdetect.comp.glsl
+@@ -28,6 +28,7 @@
+ 
+ layout (constant_id = 0) const uint plane = 0;
+ layout (constant_id = 1) const uint slices = 0;
++layout (constant_id = 2) const uint rgb_input = 0;
+ 
+ layout (local_size_x_id = 253, local_size_y_id = 254, local_size_z_id = 255) in;
+ 
+@@ -51,8 +52,12 @@
+      * otherwise be counted as black */
+     bool in_bounds = all(lessThan(pos, imageSize(input_img[plane])));
+     float value = 0.0f;
+-    if (in_bounds)
+-        value = imageLoad(input_img[plane], pos).x;
++    if (in_bounds) {
++        vec4 sample_value = imageLoad(input_img[plane], pos);
++        value = rgb_input != 0u
++            ? dot(sample_value.rgb, vec3(0.2126f, 0.7152f, 0.0722f))
++            : sample_value.x;
++    }
+ 
+     uvec4 isblack = subgroupBallot(in_bounds && value <= threshold);
+     if (subgroupElect())

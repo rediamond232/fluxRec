@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D sourceY;
+layout(set = 0, binding = 1) uniform sampler2D sourceUV;
+layout(set = 0, binding = 2, rgba8) writeonly uniform image2D outputImage;
+
+layout(push_constant) uniform PreviewParams {
+    uvec2 outputExtent;
+} params;
+
+void main()
+{
+    uvec2 outputPos = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(outputPos, params.outputExtent)))
+        return;
+
+    // Preview reads the converted NV12 encoder frame. Sampling that stable
+    // output avoids rereading the imported compositor RGB image, which has
+    // produced periodic empty samples on the target path.
+    vec2 uv = (vec2(outputPos) + vec2(0.5)) / vec2(params.outputExtent);
+    vec2 sourceExtent = vec2(textureSize(sourceY, 0));
+    vec2 footprint = sourceExtent / vec2(params.outputExtent);
+    vec4 rgba = vec4(0.0);
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 offset = vec2(x, y) * footprint / 3.0 / sourceExtent;
+            float yCode = texture(sourceY, uv + offset).r * 255.0;
+            vec2 chroma = texture(sourceUV, uv + offset).rg * 255.0;
+            float luma = (yCode - 16.0) / 219.0;
+            float cb = (chroma.r - 128.0) / 224.0;
+            float cr = (chroma.g - 128.0) / 224.0;
+            rgba.rgb += vec3(luma + 1.5748 * cr,
+                             luma - 0.187324 * cb - 0.468124 * cr,
+                             luma + 1.8556 * cb);
+        }
+    }
+    rgba /= 9.0;
+    imageStore(outputImage, ivec2(outputPos),
+               vec4(clamp(rgba.rgb, vec3(0.0), vec3(1.0)), 1.0));
+}

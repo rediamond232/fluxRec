@@ -1,0 +1,122 @@
+--- a/libavcodec/nvenc.h
++++ b/libavcodec/nvenc.h
+@@ -39,6 +39,13 @@
+ #include "avcodec.h"
+ 
+ #define MAX_REGISTERED_FRAMES 64
++
++typedef void (FluxrecNvencApiTimingCallback)(void *opaque, const char *stage,
++                                             int64_t frame_pts,
++                                             uint64_t elapsed_ns,
++                                             uint64_t event_monotonic_ns);
++void avcodec_set_fluxrec_nvenc_api_timing_callback(
++    AVCodecContext *avctx, FluxrecNvencApiTimingCallback *callback, void *opaque);
+ 
+ #define NVENCAPI_CHECK_VERSION(major, minor) \
+     ((major) < NVENCAPI_MAJOR_VERSION || ((major) == NVENCAPI_MAJOR_VERSION && (minor) <= NVENCAPI_MINOR_VERSION))
+@@ -275,6 +279,9 @@
+     int cbr_padding;
+     int multiview, multiview_supported;
+     int display_sei_sent;
++
++    FluxrecNvencApiTimingCallback *fluxrec_api_timing_callback;
++    void *fluxrec_api_timing_opaque;
+ } NvencContext;
+ 
+ int ff_nvenc_encode_init(AVCodecContext *avctx);
+--- a/libavcodec/nvenc.c
++++ b/libavcodec/nvenc.c
+@@ -36,6 +36,8 @@
+ #include "libavutil/pixdesc.h"
+ #include "libavutil/timecode_internal.h"
+ #include "libavutil/mathematics.h"
++#include "libavutil/avstring.h"
++#include "libavutil/time.h"
+ #include "libavutil/mastering_display_metadata.h"
+ #include "libavutil/stereo3d.h"
+ #include "libavutil/tdrdi.h"
+@@ -91,6 +93,45 @@
+ #endif
+     NULL,
+ };
++
++/* Private Fluxrec API: set after avcodec_open2(), before frame submission. */
++void avcodec_set_fluxrec_nvenc_api_timing_callback(
++    AVCodecContext *avctx, FluxrecNvencApiTimingCallback *callback, void *opaque)
++{
++    NvencContext *ctx;
++
++    if (!avctx || !avctx->codec || !avctx->priv_data ||
++        (av_strcasecmp(avctx->codec->name, "h264_nvenc") &&
++         av_strcasecmp(avctx->codec->name, "hevc_nvenc")))
++        return;
++
++    ctx = avctx->priv_data;
++    ctx->fluxrec_api_timing_callback = callback;
++    ctx->fluxrec_api_timing_opaque = callback ? opaque : NULL;
++}
++
++static uint64_t fluxrec_api_elapsed_ns(int64_t start_us, int64_t end_us)
++{
++    uint64_t elapsed_us;
++
++    if (end_us <= start_us)
++        return 0;
++
++    elapsed_us = end_us - start_us;
++    if (elapsed_us > UINT64_MAX / 1000)
++        return UINT64_MAX;
++
++    return elapsed_us * 1000;
++}
++
++static uint64_t fluxrec_api_monotonic_ns(int64_t time_us)
++{
++    if (!av_gettime_relative_is_monotonic() || time_us <= 0 ||
++        (uint64_t)time_us > (uint64_t)INT64_MAX / 1000)
++        return 0;
++
++    return (uint64_t)time_us * 1000;
++}
+ 
+ #define IS_10BIT(pix_fmt)  (pix_fmt == AV_PIX_FMT_P010         || \
+                             pix_fmt == AV_PIX_FMT_P012         || \
+@@ -2580,7 +2621,18 @@
+     lock_params.doNotWait = 0;
+     lock_params.outputBitstream = tmpoutsurf->output_surface;
+ 
++    int64_t fluxrec_lock_start_us = ctx->fluxrec_api_timing_callback
++        ? av_gettime_relative() : 0;
+     nv_status = p_nvenc->nvEncLockBitstream(ctx->nvencoder, &lock_params);
++    if (ctx->fluxrec_api_timing_callback && nv_status == NV_ENC_SUCCESS &&
++        lock_params.outputTimeStamp <= INT64_MAX) {
++        const int64_t fluxrec_lock_end_us = av_gettime_relative();
++        ctx->fluxrec_api_timing_callback(ctx->fluxrec_api_timing_opaque,
++            "nvenc_lock_bitstream_api_wall",
++            (int64_t)lock_params.outputTimeStamp,
++            fluxrec_api_elapsed_ns(fluxrec_lock_start_us, fluxrec_lock_end_us),
++            fluxrec_api_monotonic_ns(fluxrec_lock_end_us));
++    }
+     if (nv_status != NV_ENC_SUCCESS) {
+         res = nvenc_print_error(avctx, nv_status, "Failed locking bitstream buffer");
+         goto error;
+@@ -3097,7 +3148,19 @@
+     if (res < 0)
+         return res;
+ 
++    const int64_t fluxrec_frame_pts = frame && frame->buf[0]
++        ? frame->pts : AV_NOPTS_VALUE;
++    int64_t fluxrec_encode_start_us = ctx->fluxrec_api_timing_callback
++        ? av_gettime_relative() : 0;
+     nv_status = p_nvenc->nvEncEncodePicture(ctx->nvencoder, &pic_params);
++    if (ctx->fluxrec_api_timing_callback && fluxrec_frame_pts != AV_NOPTS_VALUE &&
++        (nv_status == NV_ENC_SUCCESS || nv_status == NV_ENC_ERR_NEED_MORE_INPUT)) {
++        const int64_t fluxrec_encode_end_us = av_gettime_relative();
++        ctx->fluxrec_api_timing_callback(ctx->fluxrec_api_timing_opaque,
++            "nvenc_encode_picture_api_wall", fluxrec_frame_pts,
++            fluxrec_api_elapsed_ns(fluxrec_encode_start_us, fluxrec_encode_end_us),
++            fluxrec_api_monotonic_ns(fluxrec_encode_end_us));
++    }
+ 
+     for (i = 0; i < sei_count; i++)
+         av_freep(&(ctx->sei_data[i].payload));

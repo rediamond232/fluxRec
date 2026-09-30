@@ -1,0 +1,164 @@
+--- a/libavfilter/vulkan_filter.h
++++ b/libavfilter/vulkan_filter.h
+@@ -33,6 +33,14 @@
+     uint64_t batch_total_ns;
+     uint64_t batch_min_ns;
+     uint64_t batch_max_ns;
++    int wait_policy_initialized;
++    int wait_simple_enabled;
++    int wait_skip_filter;
++    int wait_timing_enabled;
++    uint64_t wait_batch_samples;
++    uint64_t wait_batch_total_us;
++    uint64_t wait_batch_min_us;
++    uint64_t wait_batch_max_us;
+ } FFVkFilterTiming;
+ 
+ /**
+@@ -58,6 +66,9 @@
+                                 VkSampler sampler, uint32_t wgc_z,
+                                 void *push_src, size_t push_size);
+ 
++void ff_vk_filter_wait_timing_flush(AVFilterContext *avctx,
++                                    FFVkFilterTiming *timing);
++
+ /**
+  * Submit a compute shader with a single in and single out with 2 stages.
+  */
+--- a/libavfilter/vulkan_filter.c
++++ b/libavfilter/vulkan_filter.c
+@@ -22,7 +22,9 @@
+ #include "vulkan_filter.h"
+ #include "libavutil/vulkan_loader.h"
+ #include "libavutil/getenv_utf8.h"
++#include "libavutil/time.h"
+ #include <inttypes.h>
++#include <string.h>
+ 
+ int ff_vk_filter_init_context(AVFilterContext *avctx, FFVulkanContext *s,
+                               AVBufferRef *frames_ref,
+@@ -249,6 +251,12 @@
+ {
+     int err = 0;
+     char *sync_wait;
++    char *skip_filter;
++    char *wait_timing;
++    int wait_enabled = 0;
++    int skip_this_filter = 0;
++    int time_wait = 0;
++    int64_t wait_begin_us = 0;
+     FFVulkanFunctions *vk = &vkctx->vkfn;
+     VkImageView in_views[AV_NUM_DATA_POINTERS];
+     VkImageView out_views[AV_NUM_DATA_POINTERS];
+@@ -361,15 +369,98 @@
+     if (err < 0)
+         return err;
+ 
+-    sync_wait = getenv_utf8("FLUXREC_FF_VK_WAIT_SIMPLE");
+-    if (sync_wait && sync_wait[0])
++    if (timing) {
++        if (!timing->wait_policy_initialized) {
++            sync_wait = getenv_utf8("FLUXREC_FF_VK_WAIT_SIMPLE");
++            skip_filter = getenv_utf8("FLUXREC_FF_VK_SKIP_WAIT_FILTER");
++            wait_timing = getenv_utf8("FLUXREC_FF_VK_WAIT_TIMING");
++            timing->wait_simple_enabled = sync_wait && sync_wait[0];
++            timing->wait_skip_filter = skip_filter && avctx->name &&
++                                       !strcmp(skip_filter, avctx->name);
++            timing->wait_timing_enabled = wait_timing && !strcmp(wait_timing, "1");
++            timing->wait_policy_initialized = 1;
++            if (timing->wait_simple_enabled || timing->wait_skip_filter ||
++                timing->wait_timing_enabled) {
++                av_log(avctx, AV_LOG_INFO,
++                       "FLUXREC_FF_VK_WAIT filter=%s action=%s timing=%s\n",
++                       avctx->name ? avctx->name : "(unnamed)",
++                       !timing->wait_simple_enabled ? "disabled" :
++                       timing->wait_skip_filter ? "skip" : "wait",
++                       timing->wait_timing_enabled ? "enabled" : "disabled");
++            }
++            freeenv_utf8(sync_wait);
++            freeenv_utf8(skip_filter);
++            freeenv_utf8(wait_timing);
++        }
++        wait_enabled = timing->wait_simple_enabled;
++        skip_this_filter = timing->wait_skip_filter;
++        time_wait = timing->wait_timing_enabled;
++    } else {
++        sync_wait = getenv_utf8("FLUXREC_FF_VK_WAIT_SIMPLE");
++        skip_filter = getenv_utf8("FLUXREC_FF_VK_SKIP_WAIT_FILTER");
++        wait_timing = getenv_utf8("FLUXREC_FF_VK_WAIT_TIMING");
++        wait_enabled = sync_wait && sync_wait[0];
++        skip_this_filter = skip_filter && avctx->name &&
++                           !strcmp(skip_filter, avctx->name);
++        time_wait = wait_timing && !strcmp(wait_timing, "1");
++        freeenv_utf8(sync_wait);
++        freeenv_utf8(skip_filter);
++        freeenv_utf8(wait_timing);
++    }
++    if (wait_enabled && !skip_this_filter) {
++        if (time_wait)
++            wait_begin_us = av_gettime_relative();
+         ff_vk_exec_wait(vkctx, exec);
+-    freeenv_utf8(sync_wait);
++        if (time_wait && timing) {
++            const int64_t wait_end_us = av_gettime_relative();
++            const uint64_t elapsed_us = wait_end_us >= wait_begin_us
++                ? (uint64_t)(wait_end_us - wait_begin_us) : 0;
++            if (!timing->wait_batch_samples ||
++                elapsed_us < timing->wait_batch_min_us)
++                timing->wait_batch_min_us = elapsed_us;
++            if (elapsed_us > timing->wait_batch_max_us)
++                timing->wait_batch_max_us = elapsed_us;
++            timing->wait_batch_total_us += elapsed_us;
++            timing->wait_batch_samples++;
++            if (timing->wait_batch_samples == 360) {
++                av_log(avctx, AV_LOG_INFO,
++                       "FLUXREC_FF_VK_WAIT_TIMING filter=%s samples=%" PRIu64
++                       " mean_us=%" PRIu64 " min_us=%" PRIu64 " max_us=%" PRIu64 "\n",
++                       avctx->name ? avctx->name : "(unnamed)",
++                       timing->wait_batch_samples,
++                       timing->wait_batch_total_us / timing->wait_batch_samples,
++                       timing->wait_batch_min_us, timing->wait_batch_max_us);
++                timing->wait_batch_samples = 0;
++                timing->wait_batch_total_us = 0;
++                timing->wait_batch_min_us = 0;
++                timing->wait_batch_max_us = 0;
++            }
++        }
++    }
+ 
+     return err;
+ fail:
+     ff_vk_exec_discard_deps(vkctx, exec);
+     return err;
++}
++
++void ff_vk_filter_wait_timing_flush(AVFilterContext *avctx,
++                                    FFVkFilterTiming *timing)
++{
++    if (!timing || !timing->wait_timing_enabled || !timing->wait_batch_samples)
++        return;
++
++    av_log(avctx, AV_LOG_INFO,
++           "FLUXREC_FF_VK_WAIT_TIMING filter=%s samples=%" PRIu64
++           " mean_us=%" PRIu64 " min_us=%" PRIu64 " max_us=%" PRIu64 "\n",
++           avctx->name ? avctx->name : "(unnamed)",
++           timing->wait_batch_samples,
++           timing->wait_batch_total_us / timing->wait_batch_samples,
++           timing->wait_batch_min_us, timing->wait_batch_max_us);
++    timing->wait_batch_samples = 0;
++    timing->wait_batch_total_us = 0;
++    timing->wait_batch_min_us = 0;
++    timing->wait_batch_max_us = 0;
+ }
+ 
+ int ff_vk_filter_process_2pass(FFVulkanContext *vkctx, FFVkExecPool *e,
+--- a/libavfilter/vf_scale_vulkan.c
++++ b/libavfilter/vf_scale_vulkan.c
+@@ -399,6 +399,7 @@
+     FFVulkanContext *vkctx = &s->vkctx;
+     FFVulkanFunctions *vk = &vkctx->vkfn;
+ 
++    ff_vk_filter_wait_timing_flush(avctx, &s->device_timing);
+     ff_vk_exec_pool_free(vkctx, &s->e);
+     ff_vk_shader_free(vkctx, &s->shd);
+     sws_free_context(&s->sws);
